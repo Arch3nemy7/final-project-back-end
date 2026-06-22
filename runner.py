@@ -43,6 +43,13 @@ MOCK_F1 = {
     "top": "DenseNet-121",
     "topF1": 0.9466,
 }
+# Synthetic per-epoch loss curves (8 epochs) so the UI loss charts render in mock
+# mode: losses[arch][scenario] = [mean train loss per epoch], gently decaying.
+MOCK_F1["losses"] = [
+    [[round(0.72 * (0.62 ** e) + 0.05 + 0.015 * si, 4) for e in range(8)]
+     for si in range(4)]
+    for _ in range(len(MOCK_F1["archs"]))
+]
 
 # --------------------------------------------------------------------------- #
 #  Parsers (pure functions — covered by tests/test_parsers.py)

@@ -139,6 +139,7 @@ def main():
     test_items = [(p, lbl) for lbl, cls in enumerate(CLASSES) for p in list_images(test_root, cls)]
 
     rows = []
+    losses = []                 # losses[arch][scenario] = [mean train loss per epoch]
     total_jobs = len(ARCHS) * len(SCENARIOS)
     job = 0
     for ai, arch in enumerate(ARCHS):
@@ -156,6 +157,7 @@ def main():
         ])
         test_loader = DataLoader(CropDataset(test_items, eval_tf), batch_size=args.batch)
         row = []
+        loss_row = []
         for si, (rf, sf) in enumerate(SCENARIOS):
             job += 1
             emit({"type": "progress", "pct": (job - 1) / total_jobs,
@@ -167,7 +169,9 @@ def main():
             opt = torch.optim.Adam(model.parameters(), lr=args.lr)
             loss_fn = nn.CrossEntropyLoss()
             model.train()
+            epoch_losses = []
             for _ in range(args.epochs):
+                run_loss, n_batches = 0.0, 0
                 for x, y in loader:
                     x, y = x.to(device), y.to(device)
                     opt.zero_grad()
@@ -179,17 +183,22 @@ def main():
                         loss = loss_fn(out, y)
                     loss.backward()
                     opt.step()
+                    run_loss += float(loss.detach()); n_batches += 1
+                epoch_losses.append(round(run_loss / n_batches, 4) if n_batches else None)
             f1 = round(evaluate(model, test_loader, device, arch), 4)
             row.append(f1)
+            loss_row.append(epoch_losses)
             del model
             if device == "cuda":
                 torch.cuda.empty_cache()
         rows.append(row)
+        losses.append(loss_row)
 
     # top classifier = best baseline (scenario I) F1
     baselines = [r[0] for r in rows]
     top_i = max(range(len(ARCHS)), key=lambda i: baselines[i])
-    value = {"archs": ARCHS, "rows": rows, "top": ARCHS[top_i], "topF1": baselines[top_i]}
+    value = {"archs": ARCHS, "rows": rows, "losses": losses,
+             "top": ARCHS[top_i], "topF1": baselines[top_i]}
 
     Path(args.out).write_text(json.dumps(value, indent=2))
     emit({"type": "progress", "pct": 1.0})
