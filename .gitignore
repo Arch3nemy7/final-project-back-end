@@ -1,0 +1,29 @@
+# Python virtual envs
+.venv/
+.venv-torch/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment (path/secrets) — keep .env.example tracked
+.env
+
+# SQLite database
+*.db
+*.sqlite
+*.sqlite3
+
+# Run artifacts (large .pkl checkpoints + sample grids) and datasets
+runs/
+data/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
