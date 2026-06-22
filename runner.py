@@ -248,8 +248,8 @@ class JobManager:
     def start_fidelity(self, run_id, num=5000, data_override=None):
         self._launch(run_id, lambda: self._fidelity(run_id, num, data_override or {}), "fidelity")
 
-    def start_feasibility(self, run_id):
-        self._launch(run_id, lambda: self._feasibility(run_id), "feasibility")
+    def start_feasibility(self, run_id, data_override=None):
+        self._launch(run_id, lambda: self._feasibility(run_id, data_override or {}), "feasibility")
 
     # ---- subprocess helpers ---------------------------------------------- #
     async def _run(self, run_id, args, cwd):
@@ -489,7 +489,23 @@ class JobManager:
         })
         self._emit(run_id, type="done")
 
-    async def _feasibility(self, run_id):
+    @staticmethod
+    def _clean_path(v):
+        return str(v or "").strip().strip('"').strip("'").strip()
+
+    def _feas_dataset(self, override, key, default, label):
+        """Resolve a feasibility dataset dir from the UI override (falling back
+        to the server default) and verify it has the two class subfolders."""
+        v = self._clean_path(override.get(key))
+        root = Path(v) if v else default
+        if not root.is_dir() or not any((root / c).is_dir() for c in ("gram_negative", "gram_positive")):
+            raise RuntimeError(
+                f"{label} dataset not found at {root} — point it at a folder containing "
+                f"gram_negative/ and gram_positive/ subfolders of crops")
+        return root
+
+    async def _feasibility(self, run_id, data_override=None):
+        data_override = data_override or {}
         if self.s.mock:
             labels = MOCK_F1["archs"]
             steps = [f"Training {i + 1} / 20 · {labels[i // 4]} · Scenario {['I', 'II', 'III', 'IV'][i % 4]}"
@@ -500,11 +516,15 @@ class JobManager:
         # Real 5-CNN x 4-scenario study via scripts/feasibility.py. It streams
         # JSON progress/result lines on stdout, which we forward verbatim.
         rd = self.s.runs_dir / run_id
+        # Real train/test splits are configurable (imported models weren't trained
+        # against the server's local data/); synth always comes from this run's gen/.
+        real = self._feas_dataset(data_override, "real", self.s.data_dir / "real", "real training")
+        test = self._feas_dataset(data_override, "test", self.s.data_dir / "test", "real test")
         script = Path(__file__).parent / "scripts" / "feasibility.py"
         args = [self.s.python_bin, str(script),
-                "--real", str(self.s.data_dir / "real"),
+                "--real", str(real),
                 "--synth", str(rd / "gen"),
-                "--test", str(self.s.data_dir / "test"),
+                "--test", str(test),
                 "--out", str(rd / "feasibility.json")]
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(Path(__file__).parent),

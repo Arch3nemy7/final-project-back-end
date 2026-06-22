@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 
 from config import settings
 from db import init_db, SessionLocal, Run, upsert_run
-from schemas import RunCreate, FormatStart, TrainStart, GenerateStart, FidelityStart, ImportModels
+from schemas import RunCreate, FormatStart, TrainStart, GenerateStart, FidelityStart, FeasibilityStart, ImportModels
 from runner import JobManager
 from importer import do_import
 
@@ -159,9 +159,9 @@ async def start_fidelity(run_id: str, body: FidelityStart, db=Depends(get_db)):
 
 
 @app.post("/api/runs/{run_id}/feasibility/start")
-async def start_feasibility(run_id: str, db=Depends(get_db)):
+async def start_feasibility(run_id: str, body: FeasibilityStart, db=Depends(get_db)):
     _ensure(db, run_id)
-    manager.start_feasibility(run_id)
+    manager.start_feasibility(run_id, {"real": body.real, "test": body.test})
     return {"ok": True}
 
 

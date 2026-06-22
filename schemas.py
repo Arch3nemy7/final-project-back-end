@@ -31,6 +31,14 @@ class FidelityStart(BaseModel):
     gp: str | None = None       # gram-positive real dataset
 
 
+class FeasibilityStart(BaseModel):
+    """Feasibility = 5-CNN x 4-scenario macro-F1 study against real datasets.
+    Synthetic crops come from this run's Generate output; the two real splits
+    are configurable (fall back to the server's DATA_DIR/real and /test)."""
+    real: str | None = None     # real TRAINING crops dir (gram_negative/ + gram_positive/)
+    test: str | None = None     # isolated real TEST split dir (same two-subfolder layout)
+
+
 class ImportModels(BaseModel):
     gn: str                 # gram-negative trained run directory (absolute path)
     gp: str                 # gram-positive trained run directory
