@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # Set GS_MOCK=1 to launch scripts/mock_train.py instead of the real
     # train.py — lets you demo the full real-time pipeline without a GPU.
     mock: bool = False
+    # Simulate ONLY the Format stage (MOCK_FORMAT=1): skip dataset_tool and the
+    # multi-GB formatted copy — instead link the already-staged source archive as
+    # the run's dataset, so REAL training (and every other stage) still runs on
+    # real data. Saves disk while keeping the GPU stages genuine.
+    mock_format: bool = False
 
     @property
     def origins_list(self) -> list[str]:

@@ -24,7 +24,9 @@ Event protocol (one JSON object per SSE message, discriminated by ``type``):
 import asyncio
 import json
 import math
+import os
 import re
+import signal
 import time
 import zipfile
 from pathlib import Path
@@ -140,6 +142,22 @@ def build_train_args(cfg: dict, data_path, outdir) -> list[str]:
     return a
 
 
+def _downscale_grid(src_png, dst_jpg, max_px: int = 1536) -> bool:
+    """Save a (large) fakes grid as a light JPEG for the UI. Lazy-imports PIL so
+    this module stays import-light; returns False if PIL is unavailable."""
+    try:
+        from PIL import Image
+        im = Image.open(src_png).convert("RGB")
+        w, h = im.size
+        if max(w, h) > max_px:
+            sc = max_px / max(w, h)
+            im = im.resize((round(w * sc), round(h * sc)), Image.LANCZOS)
+        im.save(dst_jpg, "JPEG", quality=85)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # --------------------------------------------------------------------------- #
 #  SSE broker (one per run)
 # --------------------------------------------------------------------------- #
@@ -155,10 +173,16 @@ class Broker:
         self.active = False
 
     def begin(self):
+        # A new job clears the previous job's history. Clients open their event
+        # stream only AFTER the start POST resolves (so begin() has already run),
+        # which is what stops a previous job's events leaking into the new stream.
         self.history = []
         self.active = True
 
     def end(self):
+        # Keep history: a stream that opens just after a FAST job finishes must
+        # still receive its terminal (done/error/cancelled) event. It's cleared by
+        # the next begin(), not here.
         self.active = False
 
     def publish(self, event: dict):
@@ -173,6 +197,9 @@ class Broker:
 
     async def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
+        # Replay the current job's history so a late/re-attaching client rebuilds
+        # the live chart AND catches a fast job's terminal event. (begin() cleared
+        # any previous job's history before this stream was opened.)
         for e in self.history:
             q.put_nowait(e)
         self.subscribers.add(q)
@@ -193,6 +220,8 @@ class JobManager:
         self.tasks: dict[str, asyncio.Task] = {}
         self.kinds: dict[str, str] = {}     # run_id -> running job kind (for re-attach)
         self.procs: dict[str, asyncio.subprocess.Process] = {}
+        self.cancelled: set[str] = set()    # runs whose current job a user cancelled
+        self._aux: set[asyncio.Task] = set()  # keep escalation tasks from being GC'd
 
     def broker(self, run_id: str) -> Broker:
         return self.brokers.setdefault(run_id, Broker())
@@ -224,18 +253,47 @@ class JobManager:
             self._emit(run_id, type="cancelled")
             raise
         except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
-            self._emit(run_id, type="error", message=str(exc))
+            # If the user cancelled, the subprocess dying shows up here as a
+            # non-zero-exit error first; report it as a clean cancellation.
+            if run_id in self.cancelled:
+                self._emit(run_id, type="cancelled")
+            else:
+                self._emit(run_id, type="error", message=str(exc))
         finally:
+            self.cancelled.discard(run_id)
             self.broker(run_id).end()
             self.kinds.pop(run_id, None)
 
-    async def cancel(self, run_id: str):
-        proc = self.procs.get(run_id)
-        if proc and proc.returncode is None:
+    @staticmethod
+    def _signal_tree(proc, sig):
+        """Signal the whole process group (the job + any children it spawned,
+        e.g. torch DataLoader workers), falling back to the lone process."""
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
             try:
-                proc.terminate()
+                proc.send_signal(sig)
             except ProcessLookupError:
                 pass
+
+    async def cancel(self, run_id: str):
+        # Mark first so _supervise reports a cancellation rather than an error.
+        self.cancelled.add(run_id)
+        proc = self.procs.get(run_id)
+        if proc and proc.returncode is None:
+            self._signal_tree(proc, signal.SIGTERM)
+
+            async def _escalate(p):
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    self._signal_tree(p, signal.SIGKILL)   # didn't stop -> force kill
+
+            t = asyncio.create_task(_escalate(proc))
+            self._aux.add(t)
+            t.add_done_callback(self._aux.discard)
         task = self.tasks.get(run_id)
         if task and not task.done():
             task.cancel()
@@ -263,6 +321,7 @@ class JobManager:
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,   # own process group -> cancel can kill the whole tree
         )
         self.procs[run_id] = proc
         return proc
@@ -340,6 +399,29 @@ class JobManager:
                             best, best_kimg = m["fid"], m["kimg"]
         return (round(best, 2) if best is not None else None), best_kimg, curve
 
+    def _collect_train_samples(self, run_id, cls):
+        """Persist this class's per-checkpoint fakes grids as light JPEGs so they
+        survive a page refresh — the live 'sample' SSE events are in-memory only,
+        so without this the checkpoint strip is empty after reload."""
+        sub = self._newest_subdir(self.s.runs_dir / run_id / cls)
+        if not sub:
+            return []
+        out = self.s.runs_dir / run_id / cls / "trainsamples"
+        out.mkdir(parents=True, exist_ok=True)
+        samples = []
+        for png in sorted(sub.glob("fakes*.png"),
+                          key=lambda p: kimg_from_name(p.name) if kimg_from_name(p.name) is not None else -1):
+            k = kimg_from_name(png.name)
+            if k is None:                      # skip fakes_init.png (no kimg)
+                continue
+            dst = out / f"{k}.jpg"
+            if _downscale_grid(png, dst):
+                url = f"/api/runs/{run_id}/artifacts/{cls}/trainsamples/{k}.jpg"
+            else:                              # PIL missing -> point at the raw grid
+                url = f"/api/runs/{run_id}/artifacts/{cls}/{sub.name}/{png.name}"
+            samples.append({"kimg": k, "url": url})
+        return samples
+
     @staticmethod
     def _zip_image_count(path: Path):
         if not path.exists():
@@ -354,6 +436,8 @@ class JobManager:
     async def _train(self, run_id, cfg):
         if self.s.mock:
             return await self._mock_train(run_id, cfg)
+        if self._is_demo(run_id):
+            return await self._demo_train(run_id, cfg)
         total = int(cfg.get("ticks") or 1000)
         rd = self.s.runs_dir / run_id
         for cls in ("gn", "gp"):
@@ -367,10 +451,17 @@ class JobManager:
             self._emit(run_id, type="class_done", **{"class": cls})
         gnB, gnK, gnCurve = self._best_fid(run_id, "gn")
         gpB, gpK, gpCurve = self._best_fid(run_id, "gp")
+        gn_s = self._collect_train_samples(run_id, "gn")
+        gp_s = self._collect_train_samples(run_id, "gp")
         self._save_result(run_id, "train", {
-            "gn": {"bestFid": gnB, "bestTick": gnK},
-            "gp": {"bestFid": gpB, "bestTick": gpK},
+            "gn": {"bestFid": gnB, "bestTick": gnK,
+                   "sample": gn_s[-1]["url"] if gn_s else None,
+                   "durKimg": gn_s[-1]["kimg"] if gn_s else gnK},
+            "gp": {"bestFid": gpB, "bestTick": gpK,
+                   "sample": gp_s[-1]["url"] if gp_s else None,
+                   "durKimg": gp_s[-1]["kimg"] if gp_s else gpK},
             "curveGN": gnCurve, "curveGP": gpCurve,
+            "trainSamplesGN": gn_s, "trainSamplesGP": gp_s,
         })
         self._emit(run_id, type="done")
 
@@ -423,13 +514,33 @@ class JobManager:
     async def _format(self, run_id, pos, neg, res):
         rd = self.s.runs_dir / run_id
         rd.mkdir(parents=True, exist_ok=True)
-        if self.s.mock:
+        if self.s.mock or self.s.mock_format:
+            # Simulated formatting: show the progress steps but DON'T run
+            # dataset_tool or write a multi-GB formatted copy. Instead link the
+            # already-staged source archive as this run's dataset (zero disk), so
+            # REAL training downstream still trains on real crops.
             await self._mock_simple(run_id, 3.0, steps=[
                 "Validate archives & scan images",
                 f"Resize crops -> {res}x{res} (bicubic)",
                 "Build dataset.json + Gram labels",
                 "Package training-ready dataset"])
-            self._save_result(run_id, "format", {"res": res, "cropsPos": 6054, "cropsNeg": 13141})
+            for cls, src in (("gp", pos), ("gn", neg)):
+                if not src:
+                    continue
+                source = self.s.data_dir / src
+                link = rd / f"dataset_{cls}.zip"
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                if source.exists():
+                    try:
+                        link.symlink_to(source.resolve())
+                    except OSError:
+                        pass
+            self._save_result(run_id, "format", {
+                "res": res,
+                "cropsPos": self._zip_image_count(rd / "dataset_gp.zip") or 6054,
+                "cropsNeg": self._zip_image_count(rd / "dataset_gn.zip") or 13141,
+            })
             return self._emit(run_id, type="done")
         for cls, src in (("gp", pos), ("gn", neg)):
             if not src:
@@ -458,6 +569,13 @@ class JobManager:
                        + [{"src": f"/figs/tiles/neg-{i}.png", "cls": "neg"} for i in range(16)])
             self._save_result(run_id, "generate", {"gallery": gallery, "total": (int(n) or 0) * 2})
             return self._emit(run_id, type="done")
+        if self._is_demo(run_id):
+            await self._mock_simple(run_id, 2.4, phase="Gram-positive")
+            await self._mock_simple(run_id, 2.4, phase="Gram-negative")
+            gen = self._ref_results().get("generate")
+            if gen is not None:
+                self._save_result(run_id, "generate", gen)   # reveal the seeded real gallery
+            return self._emit(run_id, type="done")
         for cls, phase in (("gp", "Gram-positive"), ("gn", "Gram-negative")):
             pkl = self._best_pkl(run_id, cls)
             args = [self.s.python_bin, "generate.py", "--network", str(pkl),
@@ -485,6 +603,8 @@ class JobManager:
         it (so the later Generate stage uses the best checkpoint)."""
         if self.s.mock:
             collected = await self._mock_fid_sweep(run_id)
+        elif self._is_demo(run_id):
+            collected = await self._demo_fid_sweep(run_id)
         else:
             collected = await self._real_fid_sweep(run_id, num, data_override or {})
         self._persist_sweep(run_id, collected)   # FID curve + best per class (results.train)
@@ -520,11 +640,37 @@ class JobManager:
             await self._mock_simple(run_id, 5.4, steps=steps)
             self._save_result(run_id, "feasibility", MOCK_F1)
             return self._emit(run_id, type="done")
-        # Real 5-CNN x 4-scenario study via scripts/feasibility.py. It streams
-        # JSON progress/result lines on stdout, which we forward verbatim.
+        if self._is_demo(run_id):
+            ref = self._ref_results()
+            feas = ref.get("feasibility") or MOCK_F1
+            archs = feas.get("archs") or MOCK_F1["archs"]
+            steps = [f"Training {i + 1} / 20 · {archs[i // 4]} · Scenario {['I', 'II', 'III', 'IV'][i % 4]}"
+                     for i in range(20)]
+            await self._mock_simple(run_id, 5.4, steps=steps)
+            self._save_result(run_id, "feasibility", feas)   # reveal the seeded real F1 table
+            gen = ref.get("generate")
+            if gen is not None:
+                self._save_result(run_id, "generate", gen)   # synth gallery (shown in Results)
+            return self._emit(run_id, type="done")
+        # Real path. Generate is folded into Feasibility: first synthesize crops
+        # from the best checkpoints (selected by Fidelity), then run the F1 study.
         rd = self.s.runs_dir / run_id
-        # Real train/test splits are configurable (imported models weren't trained
-        # against the server's local data/); synth always comes from this run's gen/.
+        n_synth = 2000
+        for cls, phase in (("gp", "Gram-positive"), ("gn", "Gram-negative")):
+            out = rd / "gen" / cls
+            have = len(list(out.glob("*.png"))) if out.exists() else 0
+            if have >= n_synth:
+                continue
+            pkl = self._best_pkl(run_id, cls)
+            if not Path(pkl).is_file():
+                raise RuntimeError(f"{cls}: no generator checkpoint to synthesize from — run Train + Fidelity first")
+            gargs = [self.s.python_bin, "generate.py", "--network", str(pkl),
+                     "--seeds", f"0-{n_synth - 1}", "--outdir", str(out)]
+            await self._simple_proc(run_id, gargs, self.s.stylegan_dir, est_sec=120,
+                                    steps=[f"Synthesizing {phase} crops ({n_synth})…"])
+
+        # Then the real 5-CNN x 4-scenario study via scripts/feasibility.py. It
+        # streams JSON progress/result lines on stdout, which we forward verbatim.
         real = self._feas_dataset(data_override, "real", self.s.data_dir / "real", "real training")
         test = self._feas_dataset(data_override, "test", self.s.data_dir / "test", "real test")
         script = Path(__file__).parent / "scripts" / "feasibility.py"
@@ -535,7 +681,8 @@ class JobManager:
                 "--out", str(rd / "feasibility.json")]
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(Path(__file__).parent),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
         self.procs[run_id] = proc
         async for raw in proc.stdout:
             line = raw.decode("utf-8", "ignore").strip()
@@ -564,6 +711,68 @@ class JobManager:
             except (ValueError, OSError):
                 return {}
         return {}
+
+    # ---- DEMO replay (seeded presentation runs) --------------------------- #
+    def _is_demo(self, run_id):
+        """Seeded presentation runs carry a `.demo` marker. Their stages replay
+        the pre-seeded REAL results with a quick animation instead of touching
+        the GPU — so a presentation never hits a missing-checkpoint error, while
+        any run the user creates themselves still executes for real."""
+        return (self.s.runs_dir / run_id / ".demo").exists()
+
+    def _ref_results(self):
+        """Canonical full real results (the completed run) used to fill in a demo
+        run's stage when it is replayed."""
+        return self._load_results("r-imported-378")
+
+    async def _demo_train(self, run_id, cfg):
+        """Animate training ticks for both generators, then reveal the run's
+        pre-seeded real train result (best FID, curves, checkpoint samples)."""
+        total = int(cfg.get("ticks") or 100)
+        step = max(1, total // 30)
+        for cls in ("gn", "gp"):
+            t, tick = 0, 0
+            while t < total:
+                t = min(total, t + step)
+                tick += 1
+                self._emit(run_id, type="tick", **{"class": cls}, tick=tick, kimg=round(t, 1),
+                           total=total, eta=(total - t) * 0.05,
+                           augment=round(0.6 * min(1.0, t / total), 3),
+                           secPerTick=10.0, secPerKimg=2.5, totalSec=tick * 10,
+                           gpumem=4.0, cpumem=2.5)
+                await asyncio.sleep(0.05)
+            self._emit(run_id, type="class_done", **{"class": cls})
+        ref = self._ref_results().get("train")
+        if ref is not None:
+            # A real metrics=none train measures no FID — strip best/curve so the
+            # best FID only appears AFTER the fidelity test runs.
+            tr = json.loads(json.dumps(ref))
+            for cls in ("gn", "gp"):
+                if cls in tr:
+                    tr[cls] = {**tr[cls], "bestFid": None, "bestTick": None}
+            for k in ("curveGN", "curveGP", "fidSamplesGN", "fidSamplesGP"):
+                tr.pop(k, None)
+            self._save_result(run_id, "train", tr)
+        self._emit(run_id, type="done")
+
+    async def _demo_fid_sweep(self, run_id):
+        """Stream the run's pre-seeded real FID-vs-checkpoint curve, then return
+        the real best per class — a fast stand-in for the GPU sweep."""
+        ref = self._ref_results()
+        train = ref.get("train", {})
+        fid = ref.get("fidelity", {})
+        collected = {}
+        for ci, cls in enumerate(("gn", "gp")):
+            curve = train.get("curveGN" if cls == "gn" else "curveGP", []) or []
+            n = len(curve) or 1
+            label = "Gram-negative" if cls == "gn" else "Gram-positive"
+            for i, pt in enumerate(curve):
+                self._emit(run_id, type="progress", pct=(ci * n + i + 1) / (2 * n),
+                           step=f"FID {label} · checkpoint {i + 1}/{n} · kimg {pt['x']}")
+                self._emit(run_id, type="fid", **{"class": cls}, x=pt["x"], y=pt["y"])
+                await asyncio.sleep(0.03)
+            collected[cls] = {"curve": curve, "best": {"fid": fid.get(cls), "kimg": fid.get(f"{cls}Tick")}}
+        return collected
 
     # ---- checkpoint FID sweep (find the best snapshot) -------------------- #
     def _ckpt_dir(self, run_id, cls):
@@ -599,7 +808,8 @@ class JobManager:
                     "--out", str(rd / f"fidsweep_{cls}.json"), "--cls", cls]
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=str(self.s.stylegan_dir),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True)
             self.procs[run_id] = proc
             async for raw in proc.stdout:
                 line = raw.decode("utf-8", "ignore").strip()

@@ -117,6 +117,49 @@ def delete_run(run_id: str, db=Depends(get_db)):
     return {"ok": True}
 
 
+@app.post("/api/reset-template")
+def reset_template(db=Depends(get_db)):
+    """Restore the seeded demo template: delete any runs created since (DB rows
+    AND their on-disk run directories), then re-assert the template runs from the
+    snapshot the seed scripts wrote. Lets you test a run freely, then snap back."""
+    import shutil
+
+    snap_path = settings.runs_dir / "_template_snapshot.json"
+    if not snap_path.is_file():
+        raise HTTPException(400, "no template snapshot — run scripts/seed_paper_results.py "
+                                 "then scripts/seed_scenarios.py first")
+    snap = json.loads(snap_path.read_text())
+    template_ids = {r["id"] for r in snap}
+
+    # Runs marked `.real` (the predefined real-pipeline run) are preserved as-is,
+    # never deleted or reset, so cleaning up the demo never wipes them.
+    def _keep(rid):
+        return rid in template_ids or (settings.runs_dir / rid / ".real").exists()
+
+    # 1) drop every run that isn't part of the template (DB rows + run dirs)
+    removed = []
+    for run in db.query(Run).all():
+        if not _keep(run.id):
+            db.delete(run)
+            removed.append(run.id)
+    db.commit()
+    for d in settings.runs_dir.iterdir():
+        if d.is_dir() and not _keep(d.name):
+            shutil.rmtree(d, ignore_errors=True)
+
+    # 2) re-assert the template runs (restores any edited/deleted one) and
+    #    rewrite each results.json from the snapshot's embedded results
+    for r in snap:
+        upsert_run(db, r["id"], name=r.get("name"), dataset=r.get("dataset"),
+                   config=r.get("config") or {}, pipe=r.get("pipe") or {})
+        res = (r.get("pipe") or {}).get("results") or {}
+        rd = settings.runs_dir / r["id"]
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "results.json").write_text(json.dumps(res, indent=2))
+        (rd / ".demo").touch()   # template runs are presentation runs -> stages replay
+    return {"ok": True, "restored": sorted(template_ids), "removed": removed}
+
+
 # --------------------------------------------------------------------------- #
 #  Stage actions
 # --------------------------------------------------------------------------- #
